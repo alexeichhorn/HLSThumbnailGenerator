@@ -25,23 +25,13 @@
 import AVFoundation
 import CoreImage
 
-public protocol ThumbnailGeneratorDelegate: class {
-
-    func thumbnailGenerator(_ thumbnailGenerator: ThumbnailGenerator, didGenerateThumbnail thumbnail: Image, atTime time: Double)
-    func thumbnailGenerator(_ thumbnailGenerator: ThumbnailGenerator, thumbnailGenerationDidFailWithError error: ThumbnailGenerationError,
-                            atTime time: Double)
-
-}
-
-public final class ThumbnailGenerator {
+public final class ThumbnailGenerator: AVAssetImageGenerator {
 
     private enum PlayerState {
         case loading
         case ready
     }
 
-    public let asset: AVAsset
-    public weak var delegate: ThumbnailGeneratorDelegate?
     private(set) var times: [Double] = []
 
     var player: AVPlayer!
@@ -50,8 +40,8 @@ public final class ThumbnailGenerator {
     private var playerState: PlayerState = .loading {
         didSet {
             guard playerState == .ready, !times.isEmpty else { return }
-            generateNextThumbnail()
-            
+			generateNextThumbnail(completionHandler: { _, _, _ in })
+
         }
     }
 
@@ -59,13 +49,15 @@ public final class ThumbnailGenerator {
     private let backgroundQueue: Dispatching
 
     init(asset: AVAsset, mainQueue: Dispatching, backgroundQueue: Dispatching) {
-        self.asset = asset
         self.mainQueue = mainQueue
         self.backgroundQueue = backgroundQueue
+
+		super.init(asset: asset)
+
         setup()
     }
 
-    public convenience init(asset: AVAsset) {
+	public convenience override init(asset: AVAsset) {
         let defaultBackgroundQueue = DispatchQueue(label: "com.thumbnail-generator.background")
         self.init(asset: asset, mainQueue: DispatchQueue.main, backgroundQueue: defaultBackgroundQueue)
     }
@@ -100,65 +92,72 @@ public final class ThumbnailGenerator {
 
     // MARK: - Thumbnail Generation
 
-    public func generateThumbnails(atTimesInSeconds times: [Double]) {
+	public override func generateCGImageAsynchronously(for requestedTime: CMTime, completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
+		generateThumbnail(atTimeInSeconds: requestedTime.seconds, completionHandler: handler)
+	}
+
+	public override func generateCGImagesAsynchronously(forTimes requestedTimes: [NSValue], completionHandler handler: @escaping AVAssetImageGeneratorCompletionHandler) {
+		generateThumbnails(atTimesInSeconds: requestedTimes.map { $0.timeValue.seconds }, completionHandler: {
+			handler($1, $0, $1, $2 == nil ? .succeeded : .failed, $2)
+		})
+	}
+
+    public func generateThumbnails(atTimesInSeconds times: [Double], completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         self.times += times
         guard playerState == .ready else { return }
-        backgroundQueue.async(generateNextThumbnail)
+		backgroundQueue.async {
+			self.generateNextThumbnail(completionHandler: handler)
+		}
     }
 
-    private func generateNextThumbnail() {
+    private func generateNextThumbnail(completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         guard !times.isEmpty else { return }
         let time = times.removeFirst()
-        generateThumbnail(atTimeInSeconds: time)
+		generateThumbnail(atTimeInSeconds: time, completionHandler: handler)
     }
 
-    private func generateThumbnail(atTimeInSeconds time: Double) {
+    private func generateThumbnail(atTimeInSeconds time: Double, completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         let time = CMTime(seconds: time, preferredTimescale: 1)
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] isFinished in
             guard let self = self else { return }
             guard isFinished else {
                 self.mainQueue.async {
-                    self.delegate?.thumbnailGenerator(self, thumbnailGenerationDidFailWithError: .seekInterrupted, atTime: time.seconds)
+					handler(nil, time, ThumbnailGenerationError.seekInterrupted)
                 }
-                self.generateNextThumbnail()
+				self.generateNextThumbnail(completionHandler: handler)
                 return
             }
             self.backgroundQueue.delay(0.3) {
-                self.didFinishSeeking(toTime: time)
+                self.didFinishSeeking(toTime: time, completionHandler: handler)
             }
         }
     }
 
-    private func didFinishSeeking(toTime time: CMTime) {
+    private func didFinishSeeking(toTime time: CMTime, completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         guard let buffer = videoOutput?.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else {
             mainQueue.async {
-                self.delegate?.thumbnailGenerator(self, thumbnailGenerationDidFailWithError: .copyPixelBufferFailed, atTime: time.seconds)
+				handler(nil, time, ThumbnailGenerationError.copyPixelBufferFailed)
             }
-            generateNextThumbnail()
+            generateNextThumbnail(completionHandler: handler)
             return
         }
-        processPixelBuffer(buffer, atTime: time.seconds)
+        processPixelBuffer(buffer, atTime: time.seconds, completionHandler: handler)
     }
 
-    private func processPixelBuffer(_ buffer: CVPixelBuffer, atTime time: Double) {
+    private func processPixelBuffer(_ buffer: CVPixelBuffer, atTime time: Double, completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         defer {
-            generateNextThumbnail()
+			generateNextThumbnail(completionHandler: handler)
         }
         let ciImage = CIImage(cvPixelBuffer: buffer)
         let imageRect = CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
         guard let videoImage = CIContext().createCGImage(ciImage, from: imageRect) else {
             mainQueue.async {
-                self.delegate?.thumbnailGenerator(self, thumbnailGenerationDidFailWithError: .imageCreationFailed, atTime: time)
+				handler(nil, CMTime(seconds: time, preferredTimescale: .max), ThumbnailGenerationError.imageCreationFailed)
             }
             return
         }
-        #if os(iOS) || os(tvOS) || os(watchOS)
-        let image = Image(cgImage: videoImage)
-        #elseif os(OSX)
-        let image = Image(cgImage: videoImage, size: imageRect.size)
-        #endif
         mainQueue.async {
-            self.delegate?.thumbnailGenerator(self, didGenerateThumbnail: image, atTime: time)
+			handler(videoImage, CMTime(seconds: time, preferredTimescale: .max), nil)
         }
     }
 
