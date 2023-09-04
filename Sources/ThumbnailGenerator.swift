@@ -39,11 +39,11 @@ public final class ThumbnailGenerator: AVAssetImageGenerator {
     private var videoOutput: AVPlayerItemVideoOutput?
     private var playerState: PlayerState = .loading {
         didSet {
-            guard playerState == .ready, !times.isEmpty else { return }
-			generateNextThumbnail(completionHandler: { _, _, _ in })
-
+            guard playerState == .ready, !times.isEmpty, let completionHandler else { return }
+			generateNextThumbnail(completionHandler: completionHandler)
         }
     }
+	private var completionHandler: ((CGImage?, CMTime, Error?) -> Void)?
 
     private let mainQueue: Dispatching
     private let backgroundQueue: Dispatching
@@ -104,7 +104,10 @@ public final class ThumbnailGenerator: AVAssetImageGenerator {
 
     public func generateThumbnails(atTimesInSeconds times: [Double], completionHandler handler: @escaping (CGImage?, CMTime, Error?) -> Void) {
         self.times += times
-        guard playerState == .ready else { return }
+		guard playerState == .ready else {
+			completionHandler = handler
+			return
+		}
 		backgroundQueue.async {
 			self.generateNextThumbnail(completionHandler: handler)
 		}
